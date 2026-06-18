@@ -1,0 +1,524 @@
+"""
+secondAgentTest.py — 增强版智能旅行助手
+==========================================
+在 FirstAgentTest.py 的 ReAct 架构基础上扩展了三个功能：
+1. 记忆功能 — 记录用户偏好（景点类型、预算等）
+2. 售罄备选 — 门票售罄时自动搜索替代方案
+3. 拒绝反思 — 连续拒绝3次后反思调整策略
+
+架构变化：
+- 从"一次性查询"改为"多轮对话"（使用 input() 交互）
+- 新增 Action 类型: AskUser, UpdatePreferences, Reflect
+- 新增工具: check_availability, search_alternative
+- 动态 System Prompt（每次循环注入记忆上下文）
+"""
+import os
+import re
+import json
+import pathlib
+import sys
+import requests
+from dotenv import load_dotenv
+from tavily import TavilyClient
+from openai import OpenAI
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdin.reconfigure(encoding='utf-8')
+
+
+# ---- 加载环境变量 ----
+_script_dir = pathlib.Path(__file__).parent          # .../code/chapter1/
+_project_dir = _script_dir.parent.parent             # .../hello-agents/
+_env_cn = _project_dir / "新建 文本文档.env"
+_env_default = _project_dir / ".env"
+if _env_cn.exists():
+    load_dotenv(_env_cn, override=True)
+elif _env_default.exists():
+    load_dotenv(_env_default, override=True)
+
+
+# ============================================================
+# 1. 工具函数
+# ============================================================
+
+def get_weather(city: str) -> str:
+    """通过 wttr.in 查询实时天气"""
+    url = f"https://wttr.in/{city}?format=j1"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        c = data["current_condition"][0]
+        desc = c["weatherDesc"][0]["value"]
+        temp = c["temp_C"]
+        return f"{city}当前天气: {desc}，气温{temp}℃"
+    except requests.exceptions.RequestException as e:
+        return f"错误: 查询天气时网络问题 — {e}"
+    except (KeyError, IndexError) as e:
+        return f"错误: 解析天气数据失败，城市名可能无效 — {e}"
+
+
+def get_attraction(city: str, weather: str = "") -> str:
+    """根据城市和天气搜索推荐景点"""
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        return "错误: 未配置有效的 TAVILY_API_KEY"
+    tavily = TavilyClient(api_key=api_key)
+    weather_suffix = f"在{weather}天气下" if weather else ""
+    query = f"{city} {weather_suffix}最值得去的旅游景点推荐及理由"
+    try:
+        resp = tavily.search(query=query, search_depth="basic", include_answer=True)
+        if resp.get("answer"):
+            return resp["answer"]
+        results = resp.get("results", [])
+        if not results:
+            return "抱歉，没有找到相关景点推荐。"
+        lines = [f"- {r['title']}: {r['content'][:100]}" for r in results]
+        return "为您找到以下景点:\n" + "\n".join(lines)
+    except Exception as e:
+        return f"错误: 搜索景点时出现问题 — {e}"
+
+
+def search_alternative(city: str, preferences: str = "", exclude: str = "") -> str:
+    """搜索备选景点（避开已推荐/已售罄的）"""
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        return "错误: 未配置有效的 TAVILY_API_KEY"
+    tavily = TavilyClient(api_key=api_key)
+    parts = [city]
+    if preferences:
+        parts.append(preferences)
+    if exclude:
+        parts.append(f"不要{exclude}")
+    parts.append("小众冷门备选景点推荐")
+    query = " ".join(parts)
+    try:
+        resp = tavily.search(query=query, search_depth="basic", include_answer=True)
+        if resp.get("answer"):
+            return resp["answer"]
+        results = resp.get("results", [])
+        if not results:
+            return "未找到备选景点，建议换个城市或调整偏好。"
+        lines = [f"- {r['title']}: {r['content'][:100]}" for r in results]
+        return "备选方案:\n" + "\n".join(lines)
+    except Exception as e:
+        return f"搜索备选景点时出错 — {e}"
+
+
+def check_availability(attraction: str) -> str:
+    """检查景点门票是否可购买。有 Tavily 时搜索真实信息，否则模拟（方便测试）。"""
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        import random
+        sold_out = random.random() < 0.5
+        if sold_out:
+            return f"{attraction} ❌ 门票已售罄。"
+        return f"{attraction} ✅ 门票可购买，建议提前预约。"
+    tavily = TavilyClient(api_key=api_key)
+    query = f"{attraction} 门票 预订 售罄 余票"
+    try:
+        resp = tavily.search(query=query, search_depth="basic", include_answer=True)
+        if resp.get("answer"):
+            ans = resp["answer"]
+            if any(w in ans.lower() for w in ["售罄", "无票", "已满", "没有余票", "sold out", "no ticket", "unavailable", "not available", "booked"]):
+                return f"{attraction} ❌ 门票已售罄。{ans[:100]}"
+            return f"{attraction} ✅ 门票可购买。{ans[:100]}"
+        return f"{attraction} 门票状态暂不确定，建议前往官网查询。"
+    except Exception as e:
+        return f"检查门票失败: {e}"
+
+
+# ============================================================
+# 2. 用户记忆模块 (UserProfile)
+# ============================================================
+
+class UserProfile:
+    """记录用户的偏好、拒绝历史和已推荐景点"""
+
+    def __init__(self):
+        self.preferences = {"偏好类型": "历史文化", "预算": "500-1000元"}
+        self.rejection_count = 0     # 连续拒绝次数
+        self.rejection_reasons = []  # 拒绝原因
+        self.recommended = []        # 已推荐过的景点（防重复）
+
+    def update(self, key: str, value: str):
+        self.preferences[key] = value
+
+    def reject(self, reason: str = ""):
+        self.rejection_count += 1
+        if reason:
+            self.rejection_reasons.append(reason)
+
+    def reset_rejections(self):
+        self.rejection_count = 0
+        self.rejection_reasons = []
+
+    def add_recommended(self, name: str):
+        if name and name not in self.recommended:
+            self.recommended.append(name)
+
+    def context_block(self) -> str:
+        """生成供 system prompt 使用的记忆上下文"""
+        lines = []
+        if self.preferences:
+            lines.append("【已记录的用户偏好】")
+            for k, v in self.preferences.items():
+                lines.append(f"  - {k}: {v}")
+        if self.recommended:
+            lines.append("【已推荐过的景点（勿重复推荐）】")
+            for r in self.recommended[-5:]:
+                lines.append(f"  - {r}")
+        if self.rejection_count > 0:
+            lines.append(f"【用户连续拒绝次数: {self.rejection_count}】")
+            if self.rejection_reasons:
+                lines.append("【拒绝原因】")
+                for r in self.rejection_reasons[-3:]:
+                    lines.append(f"  - {r}")
+        return "\n".join(lines)
+
+
+# ============================================================
+# 3. LLM 客户端
+# ============================================================
+
+class OpenAICompatibleClient:
+    """兼容 OpenAI API 的 LLM 客户端（DeepSeek / AIHubmix 等）"""
+
+    def __init__(self):
+        self.api_key = os.environ.get("OPENAI_API_KEY")
+        self.base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+        self.model = os.environ.get("MODEL_NAME", "deepseek-chat")
+        if not self.api_key:
+            raise ValueError("环境变量 OPENAI_API_KEY 未设置")
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+    def generate(self, prompt: str, system_prompt: str) -> str:
+        """调用 LLM 生成回复"""
+        print("  [LLM] 正在思考...")
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=False,
+                timeout=60,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            print(f"  [LLM] 错误: {e}")
+            return f"错误: LLM 调用失败 — {e}"
+
+
+# ============================================================
+# 4. 偏好提取（轻量 LLM 调用）
+# ============================================================
+
+def extract_preferences(text: str, llm: OpenAICompatibleClient) -> dict:
+    """用 LLM 从用户文本中提取偏好信息，返回 dict。"""
+    prompt = f"""从下面用户说的话里提取出旅游相关的偏好信息，只返回 JSON。
+
+支持的字段（没有的字段不要出现在 JSON 中）:
+- "偏好类型": 如 "历史文化", "自然风光", "美食", "购物", "亲子", "探险", "休闲"
+- "预算": 如 "500-1000元", "经济型", "不限"
+- "出行时间": 如 "周末", "节假日", "暑假", "平日"
+- "交通方式": 如 "公共交通", "自驾"
+- "其他偏好": 上面没覆盖到的
+
+如果完全没提到偏好，返回 {{}}
+
+用户说的话: {text}
+
+JSON:"""
+    try:
+        ans = llm.generate(prompt, "你是一个偏好提取助手。只输出 JSON，不要多余内容。")
+        m = re.search(r"\{.*\}", ans, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except (json.JSONDecodeError, Exception):
+        pass
+    return {}
+
+
+# ============================================================
+# 5. System Prompt 构建器（每次循环动态生成，含记忆）
+# ============================================================
+
+def build_system_prompt(profile: UserProfile) -> str:
+    ctx = profile.context_block()
+    memory_section = ctx if ctx else "（暂无偏好记录，请先询问用户喜好）"
+
+    return f"""你是一个智能旅行助手。请通过 ReAct（Thought-Action-Observation）模式一步步解决问题。
+
+========== 可用工具 ==========
+- get_weather(city: str): 查询指定城市实时天气
+- get_attraction(city: str, weather: str): 根据城市和天气搜索景点
+- check_availability(attraction: str): 检查景点门票是否可购买
+- search_alternative(city: str, preferences: str, exclude: str): 搜索备选景点
+
+========== 用户记忆（自动维护） ==========
+{memory_section}
+
+========== 输出格式 ==========
+每轮只输出一对:
+Thought: [你的思考和计划]
+Action: [具体行动]
+
+Action 必须是以下类型之一（严格遵循格式）:
+
+1️⃣ 工具调用 → function_name(arg1="value1", arg2="value2")
+   范例: get_weather(city="北京")
+
+2️⃣ 完成任务 → Finish[最终答案]
+   范例: Finish[北京今天天气晴朗，推荐去故宫游览，门票可购买。]
+
+3️⃣ 询问用户 → AskUser[问题内容]
+   用于: 询问偏好、征求意见、确认是否满意推荐
+   范例: AskUser[您喜欢什么类型的景点？历史文化还是自然风光？]
+
+4️⃣ 保存偏好 → UpdatePreferences(key="字段名", value="值")
+   用于: 当用户提到偏好时立即保存
+   范例: UpdatePreferences(key="偏好类型", value="历史文化")
+
+5️⃣ 反思策略 → Reflect[分析内容]
+   用于: 连续推荐被拒绝后反思调整策略
+   范例: Reflect[用户连续拒绝，可能是不喜欢历史文化景点，应改为推荐自然风光类]
+
+========== 行为规则 ==========
+
+📌 记忆规则
+- 发现用户偏好立即用 UpdatePreferences 保存
+- 每次推荐前先参考已保存的偏好
+- 不要推荐已经推荐过的景点
+
+📌 售罄处理
+- 推荐景点前先调用 check_availability 检查门票
+- 若门票 ❌ 已售罄，立即调用 search_alternative 找备选
+- 找到可用的备选后再推荐给用户
+
+📌 拒绝处理
+- 每次推荐后应询问用户是否满意（AskUser）
+- 如果用户拒绝（说不喜欢、没意思、换一个等），注意观察连续拒绝次数
+- 连续拒绝3次后，必须使用 Reflect 分析原因并调整策略
+- 反思后不能再推荐同类型的景点
+
+📌 通用规则
+- 每次只输出一对 Thought / Action
+- Action 保持在一行内
+- 信息足够回答用户问题时用 Finish 结束
+- 保持对话自然友好"""
+
+
+# ============================================================
+# 6. 主循环——增强 ReAct
+# ============================================================
+
+def main():
+    print("=" * 55)
+    print("  🌍 智能旅行助手 v2.0")
+    print("  功能: 偏好记忆 / 售罄备选 / 拒绝反思")
+    print("  输入 quit 退出")
+    print("=" * 55)
+
+    # ---- 初始化 ----
+    try:
+        llm = OpenAICompatibleClient()
+    except ValueError as e:
+        print(f"\n❌ {e}")
+        print("   请检查环境变量或 .env 文件中的 OPENAI_API_KEY")
+        return
+
+    profile = UserProfile()
+
+    tools = {
+        "get_weather": get_weather,
+        "get_attraction": get_attraction,
+        "check_availability": check_availability,
+        "search_alternative": search_alternative,
+    }
+
+    # ---- 获取用户初始输入 ----
+    first_input = input("\n你: ").strip()
+    if first_input.lower() in ("quit", "exit"):
+        print("再见！")
+        return
+
+    conversation = [f"用户: {first_input}"]
+
+    # 提取初始偏好
+    prefs = extract_preferences(first_input, llm)
+    for k, v in prefs.items():
+        profile.update(k, v)
+        print(f"  📝 已记忆偏好: {k} = {v}")
+
+    MAX_CYCLES = 15
+    past_actions = []          # 检测重复工具循环
+    TOOL_REPEAT_LIMIT = 3      # 同一工具调用 >= 此值时强制 Finish
+
+    # ---- ReAct 主循环 ----
+    for cycle in range(MAX_CYCLES):
+        print(f"\n{'─' * 40}")
+        print(f"  思考循环 [{cycle + 1}/{MAX_CYCLES}]")
+        print(f"{'─' * 40}")
+
+        # 构建带记忆的 system prompt
+        system_prompt = build_system_prompt(profile)
+        full_prompt = "\n".join(conversation)
+
+        # 调用 LLM
+        llm_out = llm.generate(full_prompt, system_prompt)
+
+        # 截断多余 Thought-Action 对（模型偶尔会多输出几轮）
+        m = re.search(
+            r"(Thought:.*?Action:.*?)(?=\n\s*(?:Thought:|Action:|Observation:)|\Z)",
+            llm_out,
+            re.DOTALL,
+        )
+        if m:
+            llm_out = m.group(1).strip()
+
+        print(f"  [输出]\n{llm_out}\n")
+        conversation.append(llm_out)
+
+        # ---- 解析 Action ----
+        am = re.search(r"Action: (.*)", llm_out, re.DOTALL)
+        if not am:
+            obs = "Observation: 错误 — 未找到 Action 字段，请确保格式为 Thought: ... Action: ..."
+            print(f"  {obs}")
+            conversation.append(obs)
+            continue
+
+        action = am.group(1).strip()
+
+        # ──── 1) Finish ────
+        if action.startswith("Finish"):
+            fm = re.search(r"Finish\[(.*)\]", action)
+            answer = fm.group(1) if fm else "任务完成"
+            print(f"\n  ✅ {answer}")
+            break
+
+        # ──── 2) AskUser — 询问用户 ────
+        if action.startswith("AskUser"):
+            qm = re.search(r"AskUser\[(.*)\]", action)
+            question = qm.group(1) if qm else "请问您有什么想法？"
+            print(f"\n  🤖 助手: {question}")
+            user_in = input("  你: ").strip()
+
+            if user_in.lower() in ("quit", "exit"):
+                print("再见！")
+                return
+
+            # 从回复中提取偏好
+            new_prefs = extract_preferences(user_in, llm)
+            for k, v in new_prefs.items():
+                profile.update(k, v)
+                print(f"  📝 已记忆偏好: {k} = {v}")
+
+            # ---- 检测拒绝 ----
+            reject_words = [
+                "不要", "不喜欢", "不好", "没意思", "换一个",
+                "不感兴趣", "太贵", "算了", "不好玩", "不行",
+            ]
+            is_rejection = any(w in user_in for w in reject_words)
+
+            if is_rejection:
+                profile.reject(user_in)
+                print(f"  ⚠️  连续拒绝: {profile.rejection_count}/3")
+
+                if profile.rejection_count >= 3:
+                    print("  ⚡ 触发反思模式！")
+                    reasons = "; ".join(profile.rejection_reasons)
+                    hint = (
+                        f"【系统提示】用户已连续拒绝3次推荐。拒绝原因: {reasons}。"
+                        f"请反思当前的推荐策略，分析被拒绝的根本原因，"
+                        f"然后用 Reflect[分析内容] 输出你的反思和调整方向。"
+                    )
+                    conversation.append(hint)
+                    profile.reset_rejections()
+                    continue
+
+            conversation.append(f"用户: {user_in}")
+            continue
+
+        # ──── 3) UpdatePreferences — 保存偏好 ────
+        if action.startswith("UpdatePreferences"):
+            pairs = re.findall(r'(\w+)="([^"]*)"', action)
+            for k, v in pairs:
+                profile.update(k, v)
+                print(f"  📝 已记忆偏好: {k} = {v}")
+            conversation.append("Observation: 偏好已更新。")
+            continue
+
+        # ──── 4) Reflect — 反思 ────
+        if action.startswith("Reflect"):
+            rm = re.search(r"Reflect\[(.*)\]", action)
+            reflect_text = rm.group(1) if rm else "反思中..."
+            print(f"  🔄 反思: {reflect_text}")
+            conversation.append("Observation: 反思完成，已调整推荐策略。")
+            continue
+
+        # ──── 5) 工具调用 ────
+        tool_match = re.search(r"(\w+)\(", action)
+        if tool_match:
+            tname = tool_match.group(1)
+
+            if tname not in tools:
+                conversation.append(f"Observation: 错误 — 未知工具 '{tname}'")
+                continue
+            # ---- 重复检测 ----
+            past_actions.append(tname)
+            repeat_count = sum(1 for a in past_actions if a == tname)
+            if repeat_count >= TOOL_REPEAT_LIMIT:
+                hint = (
+                    f"[系统提示] 你已经调用 {tname} 超过 {TOOL_REPEAT_LIMIT} 次，"
+                    "请停止重复调用，直接基于已有信息 Finish 回答用户。"
+                )
+                print(f"  ⚠️ {hint}")
+                conversation.append(f"Observation: {hint}")
+                continue
+
+            # 提取参数
+            args_text = re.search(r"\((.*)\)", action)
+            kwargs = {}
+            if args_text:
+                kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_text.group(1)))
+
+            # 执行工具
+            try:
+                result = tools[tname](**kwargs)
+                preview = result[:60].replace("\n", " ")
+                print(f"  🔧 {tname}({kwargs})")
+                print(f"     → {preview}...")
+            except Exception as e:
+                result = f"工具调用异常: {e}"
+
+            # 如果返回了景点推荐，提取名称加入已推荐列表
+            if tname in ("get_attraction", "search_alternative"):
+                found = re.findall(
+                    r"([\u4e00-\u9fff]{2,8}(?:景点|景区|公园|博物馆|馆|山|寺|宫|园|城|街|海|滩|岛|湖|林|谷))",
+                    result,
+                )
+                for name in found:
+                    profile.add_recommended(name)
+
+            conversation.append(f"Observation: {result}")
+            continue
+
+        # ──── 无法识别的 Action ────
+        conversation.append(
+            "Observation: 错误 — 无法识别的 Action 格式，"
+            "请使用工具调用 / Finish / AskUser / UpdatePreferences / Reflect"
+        )
+
+    else:
+        print(f"\n  ⏰ 已达到最大思考轮次 ({MAX_CYCLES})")
+
+    print(f"\n{'=' * 55}")
+    print("  对话结束")
+    print(f"{'=' * 55}")
+
+
+if __name__ == "__main__":
+    main()
