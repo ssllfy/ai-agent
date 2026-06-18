@@ -132,7 +132,7 @@ import re
 # 请根据您使用的服务，将这里替换成对应的凭证和地址
 # --- 1. 配置LLM客户端 ---
 # DeepSeek服务凭证
-API_KEY = "sk-f32ccec0d972475391da52e5b60783cd"
+API_KEY = "you api_key"
 BASE_URL = "https://api.deepseek.com/v1"
 MODEL_ID = "deepseek-v4-pro"
 os.environ['TAVILY_API_KEY'] = "YOUR_TAVILY_API_KEY"
